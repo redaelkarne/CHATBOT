@@ -2,6 +2,7 @@ import requests
 import math
 from dealership_data import dealerships
 def geocode_address_nominatim(address: str):
+    print(f"Geocoding address: {address}")
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "q": address,
@@ -17,9 +18,13 @@ def geocode_address_nominatim(address: str):
         if results:
             lat = float(results[0]["lat"])
             lon = float(results[0]["lon"])
+            print(f"Result lat: {lat}, lon: {lon}")
             return lat, lon
+        else:
+            print("No results found for address.")
+    else:
+        print(f"Geocoding failed: {response.status_code} - {response.text}")
     return None, None
-
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius in kilometers
     phi1 = math.radians(lat1)
