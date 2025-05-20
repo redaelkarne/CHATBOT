@@ -13,4 +13,5 @@ class Appointment(Base):
     car_model = Column(String(100), nullable=True)
     issue_description = Column(String(500), nullable=True)
     preferred_datetime = Column(String(50), nullable=True)
-    matched_operation = Column(String(500), nullable=True)  # Add this line for matched_operation
+    matched_operation = Column(String(500), nullable=True) 
+    dealership_name = Column(String(100), nullable=True) 
