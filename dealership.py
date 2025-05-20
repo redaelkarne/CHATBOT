@@ -1,7 +1,6 @@
-import requests
 import math
 from dealership_data import dealerships
-def geocode_address_nominatim(address: str):
+'''def geocode_address_nominatim(address: str):
     print(f"Geocoding address: {address}")
     url = "https://nominatim.openstreetmap.org/search"
     params = {
@@ -24,7 +23,16 @@ def geocode_address_nominatim(address: str):
             print("No results found for address.")
     else:
         print(f"Geocoding failed: {response.status_code} - {response.text}")
-    return None, None
+    return None, None'''
+def geocode_address_nominatim(address: str):
+    # Always return the same fixed coordinates (e.g. Paris, France)
+    print(f"Bypassing geocoding. Using fixed coordinates for: {address}")
+    
+    fixed_lat = 48.8566  # Paris latitude
+    fixed_lon = 2.3522   # Paris longitude
+
+    return fixed_lat, fixed_lon
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius in kilometers
     phi1 = math.radians(lat1)

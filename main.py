@@ -13,6 +13,7 @@ from chat_session import session_state, get_next_field, reset_session, FIELD_LAB
 from matcher import match_issue_to_operation
 from dealership import geocode_address_nominatim, find_closest_dealership
 from datetime import datetime
+from fastapi import Query
 
 app = FastAPI()
 
@@ -32,6 +33,36 @@ class ChatRequest(BaseModel):
         sanitized = bleach.clean(v, tags=[], strip=True)
         sanitized = html.escape(sanitized)
         return sanitized
+
+# New model for receiving user details from app
+class UserDetailsRequest(BaseModel):
+    full_name: constr(strip_whitespace=True, min_length=1, max_length=100) = Field(
+        ..., description="User's full name"
+    )
+    phone_number: constr(strip_whitespace=True, min_length=5, max_length=20) = Field(
+        ..., description="User's phone number"
+    )
+    address: constr(strip_whitespace=True, min_length=5, max_length=200) = Field(
+        ..., description="User's address"
+    )
+    
+    @validator('full_name')
+    def validate_full_name(cls, v):
+        sanitized = bleach.clean(v, tags=[], strip=True)
+        sanitized = html.escape(sanitized)
+        return sanitize_input(sanitized, "full_name")
+        
+    @validator('phone_number')
+    def validate_phone_number(cls, v):
+        sanitized = bleach.clean(v, tags=[], strip=True)
+        sanitized = html.escape(sanitized)
+        return sanitize_input(sanitized, "phone_number")
+        
+    @validator('address')
+    def validate_address(cls, v):
+        sanitized = bleach.clean(v, tags=[], strip=True)
+        sanitized = html.escape(sanitized)
+        return sanitize_input(sanitized, "address")
 
 PHONE_PATTERN = re.compile(r'^\+?[0-9]{10,15}$')
 ADDRESS_PATTERN = re.compile(r'^[a-zA-Z0-9\s\.,\-\']+$')
@@ -61,7 +92,10 @@ def sanitize_input(input_str, field_type=None):
 
     elif field_type == "address":
         if not ADDRESS_PATTERN.match(input_str):
-            raise ValueError("Format d'adresse invalide.")
+            raise ValueError(
+                "Format d'adresse invalide. Veuillez entrer une adresse complète en France "
+                "(numéro, rue, code postal et ville). Exemple : '12 Rue de la Paix, 75002 Paris'"
+            )
         return input_str[:200]
 
     elif field_type == "car_model":
@@ -115,28 +149,93 @@ Formule une question claire, polie et concise en français pour demander cette i
     except Exception:
         fallback = FIELD_LABELS_FR.get(next_field, next_field)
         return f"{fallback} s'il vous plaît ?"
+@app.get("/initialize_chat")
+def initialize_chat_via_get(
+    full_name: str = Query(..., min_length=1, max_length=100),
+    phone_number: str = Query(..., min_length=5, max_length=20),
+    address: str = Query(..., min_length=5, max_length=200),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Sanitize and validate input using your sanitize_input function
+        sanitized_full_name = sanitize_input(full_name, "full_name")
+        sanitized_phone = sanitize_input(phone_number, "phone_number")
+        sanitized_address = sanitize_input(address, "address")
+
+        # Reset any existing chat session state
+        reset_session()
+
+        # Initialize session state for new chat
+        session_state.update({
+            "current_field": "car_model",
+            "data": {
+                "full_name": sanitized_full_name,
+                "phone_number": sanitized_phone,
+                "address": sanitized_address
+            },
+            "awaiting_additional_issue": False,
+            "first_chat_message": True  # Must match /chat usage
+        })
+
+        # Attempt to find closest dealership from address
+        dealership_info = ""
+        try:
+            lat, lon = geocode_address_nominatim(sanitized_address)
+            if lat is not None and lon is not None:
+                closest_dealer, distance = find_closest_dealership(lat, lon)
+                if closest_dealer:
+                    session_state["data"]["closest_dealer"] = closest_dealer
+                    dealer_name = closest_dealer["dealership_name"]
+                    city = closest_dealer["city"]
+                    dealership_info = (
+                        f"J'ai localisé votre adresse. Le concessionnaire le plus proche est "
+                        f"{dealer_name} à {city}, à environ {distance:.2f} km de chez vous. "
+                    )
+        except Exception:
+            # Ignore geocode or dealer lookup errors silently
+            pass
+
+        # Generate first question for car_model
+        ai_question = generate_next_question("car_model", session_state["data"])
+
+        # Compose response greeting + dealership info + first question
+        if dealership_info:
+            response = f"Bonjour {sanitized_full_name}. {dealership_info}{ai_question}"
+        else:
+            response = f"Bonjour {sanitized_full_name}. {ai_question}"
+
+        return {"response": response}
+
+    except ValueError as e:
+        return {"response": f"Erreur: {str(e)}. Veuillez vérifier les informations fournies."}
+    except Exception as e:
+        return {"response": f"Une erreur est survenue lors de l'initialisation du chat: {str(e)}"}
 
 @app.post("/chat")
 def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
     try:
         user_input = chat_request.message.strip()
-
         if not user_input:
             return {"response": "Veuillez entrer un message."}
 
+        if not session_state.get("data"):
+            return {"response": "Veuillez d'abord initialiser le chat avec vos informations."}
+
         user_input_lower = user_input.lower()
 
-        
+        # Handle yes/no for additional issue
         if session_state.get("awaiting_additional_issue"):
             if user_input_lower in ["oui", "yes", "y"]:
                 prev_data = session_state.get("data", {})
                 session_state["data"] = {
                     "full_name": prev_data.get("full_name", ""),
-                    "phone_number": prev_data.get("phone_number", "")
+                    "phone_number": prev_data.get("phone_number", ""),
+                    "address": prev_data.get("address", ""),
+                    "closest_dealer": prev_data.get("closest_dealer", "")
                 }
-                session_state["current_field"] = "address"
+                session_state["current_field"] = "car_model"
                 session_state["awaiting_additional_issue"] = False
-                ai_question = generate_next_question("address", session_state["data"])
+                ai_question = generate_next_question("car_model", session_state["data"])
                 return {"response": ai_question}
             elif user_input_lower in ["non", "no", "n"]:
                 reset_session()
@@ -144,51 +243,35 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             else:
                 return {"response": "Veuillez répondre par 'oui' ou 'non'."}
 
-        
-        if session_state["current_field"] is None:
-            if session_state["data"]:
-                next_field = get_next_field()
-            else:
-                next_field = get_next_field()
-            session_state["current_field"] = next_field
-            ai_question = generate_next_question(next_field, session_state["data"])
-            return {"response": ai_question}
+        # First user message to /chat: reply with LLM answer without saving input
+        if session_state.get("first_chat_message", True):
+            # Call LLM to respond naturally
+            prompt = f"Réponds de manière conviviale au client : {user_input}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}]
+            }
+            response = requests.post(API_URL, headers=HEADERS, data=json.dumps(payload))
+            response.raise_for_status()
+            content = response.json()
+            ai_reply = content["candidates"][0]["content"]["parts"][0]["text"].strip()
 
+            # Ask for car model after the first message
+            next_question = generate_next_question("car_model", session_state["data"])
+
+            session_state["first_chat_message"] = False  # Mark first message handled
+
+            return {"response": f"{ai_reply}\n\n{next_question}"}
+
+        # From second message onward, save user input to the current field
         current_field = session_state["current_field"]
 
         try:
             sanitized_input = sanitize_input(user_input, current_field)
+            session_state["data"][current_field] = sanitized_input
         except ValueError as e:
             return {"response": f"Erreur: {str(e)}. Veuillez réessayer."}
 
-        
-        if current_field == "address":
-            lat, lon = geocode_address_nominatim(sanitized_input)
-            if lat is None or lon is None:
-                return {"response": "Désolé, je n'ai pas pu localiser cette adresse. Pouvez-vous préciser ou reformuler ?"}
-
-            closest_dealer, distance = find_closest_dealership(lat, lon)
-            if closest_dealer:
-                session_state["data"]["closest_dealer"] = closest_dealer
-                dealer_name = closest_dealer["dealership_name"]
-                city = closest_dealer["city"]
-                response_msg = (
-                    f"Merci, j'ai localisé votre adresse. Le concessionnaire le plus proche est "
-                    f"{dealer_name} à {city}, à environ {distance:.2f} km de chez vous."
-                )
-            else:
-                response_msg = "Désolé, aucun concessionnaire proche n'a été trouvé."
-
-            session_state["data"][current_field] = sanitized_input
-            next_field = get_next_field()
-            session_state["current_field"] = next_field
-            ai_question = generate_next_question(next_field, session_state["data"])
-            return {"response": response_msg + " " + ai_question}
-
-        
-        session_state["data"][current_field] = sanitized_input
-
-        
+        # Special handling for issue_description to match operation
         if current_field == "issue_description":
             try:
                 matched_operation = match_issue_to_operation(sanitized_input)
@@ -196,14 +279,14 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             except Exception:
                 session_state["data"]["matched_operation"] = {"error": "Impossible de classifier la demande"}
 
-        
+        # Move to next field or save appointment if done
         next_field = get_next_field()
         if next_field:
             session_state["current_field"] = next_field
             ai_question = generate_next_question(next_field, session_state["data"])
             return {"response": ai_question}
 
-        
+        # No more fields: save appointment to DB
         try:
             matched_operation = session_state["data"].get("matched_operation")
             matched_operation_json = json.dumps(
@@ -237,26 +320,25 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
                 "data": saved_data
             }
 
-        except Exception:
+        except Exception as e:
             db.rollback()
             reset_session()
             raise HTTPException(
                 status_code=500,
-                detail="Une erreur est survenue lors de l'enregistrement de votre rendez-vous. Veuillez réessayer."
+                detail=f"Une erreur est survenue lors de l'enregistrement de votre rendez-vous. {str(e)}"
             )
 
-    except Exception:
-        return {"response": "Une erreur est survenue. Veuillez réessayer plus tard."}
+    except Exception as e:
+        return {"response": f"Une erreur est survenue. {str(e)}"}
 
-
-# New endpoint to reset chat session explicitly
+# Reset chat session explicitly
 @app.post("/reset_chat")
-def reset_session():
-    session_state.clear()
-    
+def reset_chat_endpoint():
+    reset_session()
     session_state.update({
         "current_field": None,
         "data": {},
         "awaiting_additional_issue": False,
         "is_first_message": True
     })
+    return {"response": "Session réinitialisée avec succès."}
