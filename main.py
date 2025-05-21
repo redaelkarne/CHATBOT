@@ -110,21 +110,30 @@ def sanitize_input(input_str, field_type=None):
 
     elif field_type == "preferred_datetime":
         import dateparser
+        import unicodedata
+        from datetime import datetime
+
         now = datetime.now()
+
+        # Normalize the input (removes accents inconsistently written)
+        normalized_input = unicodedata.normalize("NFKC", input_str.strip())
+
         dt = dateparser.parse(
-            input_str,
+            normalized_input,
             languages=["fr"],
             settings={
                 "PREFER_DATES_FROM": "future",
                 "RELATIVE_BASE": now,
                 "DATE_ORDER": "DMY",
-                "DEFAULT_LANGUAGES": ["fr"],
                 "RETURN_AS_TIMEZONE_AWARE": False,
+                "STRICT_PARSING": False,
             },
         )
 
         if not dt:
-            raise ValueError("Je n'ai pas compris la date et l'heure. Essayez un format comme '12/10/2025 13:00' ou 'lundi 12 octobre à 13h'.")
+            raise ValueError(
+                "Je n'ai pas compris la date et l'heure. Essayez un format comme '12/10/2025 13:00' ou 'lundi prochain à 13h'."
+            )
 
         # Catch unrealistically distant years
         if dt.year > now.year + 2:
