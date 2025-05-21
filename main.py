@@ -12,8 +12,10 @@ import models
 from chat_session import session_state, get_next_field, reset_session, FIELD_LABELS_FR
 from matcher import match_issue_to_operation
 from dealership import geocode_address_nominatim, find_closest_dealership
+import dateparser
 from datetime import datetime
 from fastapi import Query
+
 
 app = FastAPI()
 
@@ -98,20 +100,44 @@ def sanitize_input(input_str, field_type=None):
             )
         return input_str[:200]
 
-    elif field_type == "car_model":
-        return re.sub(r'[^a-zA-Z0-9\s\-\.]', '', input_str)[:100]
+    elif field_type == "car_immatriculation":
+        input_str = input_str.upper()
+        # Match a French plate format like AA-123-AA
+        match = re.search(r"\b([A-Z]{2})[-\s]?(\d{3})[-\s]?([A-Z]{2})\b", input_str)
+        if not match:
+            raise ValueError("Format d'immatriculation invalide. Exemple attendu : AA-123-AA.")
+        return match.group(0)
 
     elif field_type == "preferred_datetime":
-        # Accepts format: "DD/MM/YYYY HH:MM"
-        try:
-            dt = datetime.strptime(input_str, "%d/%m/%Y %H:%M")
-            if dt <= datetime.now():
-                raise ValueError("La date et l'heure doivent être dans le futur.")
-            return dt.strftime("%d/%m/%Y %H:%M")
-        except ValueError:
-            raise ValueError("Format invalide. Utilisez le format JJ/MM/AAAA HH:MM avec une date future.")
+        import dateparser
+        now = datetime.now()
+        dt = dateparser.parse(
+            input_str,
+            languages=["fr"],
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": now,
+                "DATE_ORDER": "DMY",
+                "DEFAULT_LANGUAGES": ["fr"],
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+
+        if not dt:
+            raise ValueError("Je n'ai pas compris la date et l'heure. Essayez un format comme '12/10/2025 13:00' ou 'lundi 12 octobre à 13h'.")
+
+        # Catch unrealistically distant years
+        if dt.year > now.year + 2:
+            dt = dt.replace(year=now.year if dt.month >= now.month else now.year + 1)
+
+        if dt <= now:
+            raise ValueError("La date et l'heure doivent être dans le futur.")
+
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     return input_str[:2000]
+
+
 
 def generate_next_question(next_field: str, collected_data: dict) -> str:
     collected_json = json.dumps(collected_data, ensure_ascii=False)
@@ -125,13 +151,23 @@ def generate_next_question(next_field: str, collected_data: dict) -> str:
         "Ne commence pas ta réponse par 'Bonjour.'\n"
     )
 
+   # Map friendly field labels for clarity
+    FR_LABELS = {
+        "car_immatriculation": "l'immatriculation du véhicule",
+        "issue_description": "la description de la panne",
+        "preferred_datetime": "la date et l'heure de disponibilité"
+    }
+
+    friendly_label = FR_LABELS.get(next_field, next_field)
+
     prompt = f"""
-Tu es un assistant convivial dans un atelier de réparation automobile.
-{greeting_instruction}
-Le client a déjà fourni ces informations : {collected_json}
-La prochaine information à demander est : {next_field}
-Formule une question claire, polie et concise en français pour demander cette information sans une confirmation que t'as pris en charge cette prompt.
-"""
+    Tu es un assistant d'atelier de réparation automobile. Le client a déjà donné : {collected_json}.
+    Ta tâche est de demander *uniquement* {friendly_label}.
+    {greeting_instruction}
+    Écris une question claire, polie, concise et naturelle en français pour obtenir cette information.
+    N'ajoute rien d'autre.
+    """
+
 
     
     session_state["is_first_message"] = False
@@ -167,7 +203,7 @@ def initialize_chat_via_get(
 
         # Initialize session state for new chat
         session_state.update({
-            "current_field": "car_model",
+             "current_field": "car_immatriculation",
             "data": {
                 "full_name": sanitized_full_name,
                 "phone_number": sanitized_phone,
@@ -196,7 +232,7 @@ def initialize_chat_via_get(
             pass
 
         # Generate first question for car_model
-        ai_question = generate_next_question("car_model", session_state["data"])
+        ai_question = generate_next_question("car_immatriculation", session_state["data"])
 
         # Compose response greeting + dealership info + first question
         if dealership_info:
@@ -223,7 +259,7 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
 
         user_input_lower = user_input.lower()
 
-        # Handle yes/no for additional issue
+        # Step 1: Handle additional issue prompt
         if session_state.get("awaiting_additional_issue"):
             if user_input_lower in ["oui", "yes", "y"]:
                 prev_data = session_state.get("data", {})
@@ -233,9 +269,9 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
                     "address": prev_data.get("address", ""),
                     "closest_dealer": prev_data.get("closest_dealer", "")
                 }
-                session_state["current_field"] = "car_model"
+                session_state["current_field"] = "car_immatriculation"
                 session_state["awaiting_additional_issue"] = False
-                ai_question = generate_next_question("car_model", session_state["data"])
+                ai_question = generate_next_question("car_immatriculation", session_state["data"])
                 return {"response": ai_question}
             elif user_input_lower in ["non", "no", "n"]:
                 reset_session()
@@ -243,35 +279,31 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             else:
                 return {"response": "Veuillez répondre par 'oui' ou 'non'."}
 
-        # First user message to /chat: reply with LLM answer without saving input
+        # Step 2: Handle first interaction
         if session_state.get("first_chat_message", True):
-            # Call LLM to respond naturally
             prompt = f"Réponds de manière conviviale au client : {user_input}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}]
-            }
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
             response = requests.post(API_URL, headers=HEADERS, data=json.dumps(payload))
             response.raise_for_status()
             content = response.json()
             ai_reply = content["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-            # Ask for car model after the first message
-            next_question = generate_next_question("car_model", session_state["data"])
+            session_state["first_chat_message"] = False
+            session_state["current_field"] = "car_immatriculation"
 
-            session_state["first_chat_message"] = False  # Mark first message handled
+            return {
+                "response": f"{ai_reply}\n\nAvant tout, pouvez-vous me donner votre immatriculation ?"
+            }
 
-            return {"response": f"{ai_reply}\n\n{next_question}"}
-
-        # From second message onward, save user input to the current field
+        # Step 3: Process current field
         current_field = session_state["current_field"]
-
         try:
             sanitized_input = sanitize_input(user_input, current_field)
             session_state["data"][current_field] = sanitized_input
         except ValueError as e:
             return {"response": f"Erreur: {str(e)}. Veuillez réessayer."}
 
-        # Special handling for issue_description to match operation
+        # Step 4: Match operation if it's the issue description
         if current_field == "issue_description":
             try:
                 matched_operation = match_issue_to_operation(sanitized_input)
@@ -279,14 +311,14 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             except Exception:
                 session_state["data"]["matched_operation"] = {"error": "Impossible de classifier la demande"}
 
-        # Move to next field or save appointment if done
+        # Step 5: Get next field or save appointment
         next_field = get_next_field()
         if next_field:
             session_state["current_field"] = next_field
             ai_question = generate_next_question(next_field, session_state["data"])
             return {"response": ai_question}
 
-        # No more fields: save appointment to DB
+        # Step 6: Save appointment
         try:
             matched_operation = session_state["data"].get("matched_operation")
             matched_operation_json = json.dumps(
@@ -300,7 +332,7 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
                 "full_name": session_state["data"].get("full_name", ""),
                 "phone": session_state["data"].get("phone_number", ""),
                 "address": session_state["data"].get("address", ""),
-                "car_model": session_state["data"].get("car_model", ""),
+                "car_immatriculation": session_state["data"].get("car_immatriculation", ""),
                 "issue_description": session_state["data"].get("issue_description", ""),
                 "preferred_datetime": session_state["data"].get("preferred_datetime", ""),
                 "matched_operation": matched_operation_json,

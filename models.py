@@ -10,7 +10,7 @@ class Appointment(Base):
     full_name = Column(String(100), nullable=True)
     phone = Column(String(20), nullable=True)
     address = Column(String(200), nullable=True)
-    car_model = Column(String(100), nullable=True)
+    car_immatriculation = Column(String(100), nullable=True)
     issue_description = Column(String(500), nullable=True)
     preferred_datetime = Column(String(50), nullable=True)
     matched_operation = Column(String(500), nullable=True) 

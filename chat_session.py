@@ -10,7 +10,8 @@ FIELDS = [
     "full_name",
     "phone_number",
     "address",
-    "car_model",
+    # "car_model",  # remove this line
+    "car_immatriculation",  # add this if missing, since you use it elsewhere
     "issue_description",
     "preferred_datetime",
 ]
@@ -19,10 +20,12 @@ FIELD_LABELS_FR = {
     "full_name": "Quel est votre nom",
     "phone_number": "Quel est votre numéro de téléphone",
     "address": "Quelle est votre adresse",
-    "car_model": "Quel est le modèle de votre voiture",
+    # "car_model": "Quel est le modèle de votre voiture",  # remove this line
+    "car_immatriculation": "Quelle est l'immatriculation de votre véhicule",  # add this
     "issue_description": "Décrivez la panne ou le problème",
     "preferred_datetime": "Quelle est votre date et heure préférée pour le rendez-vous",
 }
+
 
 def get_next_field():
     for field in FIELDS:
