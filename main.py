@@ -281,7 +281,25 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
 
         # Step 2: Handle first interaction
         if session_state.get("first_chat_message", True):
-            prompt = f"Réponds de manière conviviale au client : {user_input}"
+            user_name = session_state["data"].get("full_name", "Monsieur")
+            user_address = session_state["data"].get("address", "votre adresse")
+            closest_dealer = session_state["data"].get("closest_dealer", None)
+
+            dealer_text = ""
+            if closest_dealer:
+                dealer_name = closest_dealer.get("dealership_name", "")
+                city = closest_dealer.get("city", "")
+                dealer_text = f"Le concessionnaire le plus proche est {dealer_name} à {city}."
+
+            prompt = (
+                f"Tu es un assistant chaleureux et poli. "
+                f"Commence ta réponse par une salutation naturelle, par exemple : "
+                f'\"Bonjour Monsieur {user_name}, j’ai localisé votre adresse : {user_address}.\" '
+                f"Inclus si possible l'information suivante : {dealer_text} "
+                f"Ensuite, demande-lui poliment son immatriculation de manière naturelle, fluide et engageante, "
+                f"comme si tu parlais à un vrai client."
+            )
+
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
             response = requests.post(API_URL, headers=HEADERS, data=json.dumps(payload))
             response.raise_for_status()
@@ -292,7 +310,7 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             session_state["current_field"] = "car_immatriculation"
 
             return {
-                "response": f"{ai_reply}\n\nAvant tout, pouvez-vous me donner votre immatriculation ?"
+                "response": ai_reply
             }
 
         # Step 3: Process current field
