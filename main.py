@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, engine
 import models
 from chat_session import session_state, get_next_field, reset_session, FIELD_LABELS_FR
-from matcher import match_issue_to_operation
+from matcher import match_issue_to_operations
 from dealership import geocode_address_nominatim, find_closest_dealership
 import dateparser
 from datetime import datetime
@@ -151,7 +151,6 @@ def sanitize_input(input_str, field_type=None):
 def generate_next_question(next_field: str, collected_data: dict) -> str:
     collected_json = json.dumps(collected_data, ensure_ascii=False)
 
-    # Check if this is the first message
     is_first = session_state.get("is_first_message", True)
 
     greeting_instruction = (
@@ -160,7 +159,6 @@ def generate_next_question(next_field: str, collected_data: dict) -> str:
         "Ne commence pas ta réponse par 'Bonjour.'\n"
     )
 
-   # Map friendly field labels for clarity
     FR_LABELS = {
         "car_immatriculation": "l'immatriculation du véhicule",
         "issue_description": "la description de la panne",
@@ -169,16 +167,41 @@ def generate_next_question(next_field: str, collected_data: dict) -> str:
 
     friendly_label = FR_LABELS.get(next_field, next_field)
 
-    prompt = f"""
-    Tu es un assistant d'atelier de réparation automobile. Le client a déjà donné : {collected_json}.
-    Ta tâche est de demander *uniquement* {friendly_label}.
-    {greeting_instruction}
-    Écris une question claire, polie, concise et naturelle en français pour obtenir cette information.
-    N'ajoute rien d'autre.
-    """
+    # When asking for issue_description, propose top 3 operations as choices
+    if next_field == "issue_description":
+        # You need the raw user input or partial issue description here.
+        # Let's assume you get it from collected_data under 'issue_description' or user_input (adjust as needed)
+        user_issue_input = collected_data.get("issue_description_raw", "")  
+        # If not available, fallback to empty string
+        if not user_issue_input:
+            user_issue_input = ""
 
+        # Get top 3 matched operations using your matching function (you'll have to implement this)
+        top3_operations = match_issue_to_operations(user_issue_input)  # This returns list of dicts
 
-    
+        # Compose options list
+        options_text = "\n".join(
+            [f"{idx+1}. {op['operation_name']}" for idx, op in enumerate(top3_operations)]
+        )
+
+        prompt = (
+            f"Le client a déjà donné : {collected_json}.\n"
+            f"Ta tâche est de demander *uniquement* {friendly_label}.\n"
+            f"{greeting_instruction}\n"
+            f"Voici les trois options les plus probables pour la panne:\n{options_text}\n"
+            "Merci de choisir l'une des options en indiquant son numéro."
+        )
+
+    else:
+        # Usual prompt
+        prompt = f"""
+        Tu es un assistant d'atelier de réparation automobile. Le client a déjà donné : {collected_json}.
+        Ta tâche est de demander *uniquement* {friendly_label}.
+        {greeting_instruction}
+        Écris une question claire, polie, concise et naturelle en français pour obtenir cette information.
+        N'ajoute rien d'autre.
+        """
+
     session_state["is_first_message"] = False
 
     payload = {
@@ -192,8 +215,9 @@ def generate_next_question(next_field: str, collected_data: dict) -> str:
         ai_text = content["candidates"][0]["content"]["parts"][0]["text"].strip()
         return ai_text
     except Exception:
-        fallback = FIELD_LABELS_FR.get(next_field, next_field)
+        fallback = FR_LABELS.get(next_field, next_field)
         return f"{fallback} s'il vous plaît ?"
+
 @app.get("/initialize_chat")
 def initialize_chat_via_get(
     full_name: str = Query(..., min_length=1, max_length=100),
@@ -318,27 +342,90 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
             session_state["first_chat_message"] = False
             session_state["current_field"] = "car_immatriculation"
 
-            return {
-                "response": ai_reply
-            }
+            return {"response": ai_reply}
 
-        # Step 3: Process current field
-        current_field = session_state["current_field"]
+        current_field = session_state.get("current_field")
+
+        # Step 3.1: If waiting for user choice from top matches
+        if current_field == "awaiting_operation_choice":
+            top_matches = session_state["data"].get("top_matches", [])
+            if user_input.isdigit():
+                choice = int(user_input)
+                if 1 <= choice <= len(top_matches):
+                    session_state["data"]["matched_operation"] = top_matches[choice - 1]
+                    # Remove temporary keys
+                    session_state["data"].pop("top_matches", None)
+                    session_state["data"].pop("issue_description_raw", None)
+                    session_state["current_field"] = get_next_field()
+                    ai_question = generate_next_question(session_state["current_field"], session_state["data"])
+                    return {"response": ai_question}
+                else:
+                    return {"response": f"Numéro invalide. Veuillez choisir un chiffre entre 1 et {len(top_matches)}."}
+            elif user_input_lower in ["aucune", "none"]:
+                session_state["data"]["matched_operation"] = {
+                    "operation_name": "Demande de rappel",
+                    "category": "Autre",
+                    "time_unit": 0,
+                    "price": 0
+                }
+                session_state["data"].pop("top_matches", None)
+                session_state["data"].pop("issue_description_raw", None)
+                session_state["current_field"] = get_next_field()
+                ai_question = generate_next_question(session_state["current_field"], session_state["data"])
+                return {"response": ai_question}
+            else:
+                return {"response": "Réponse invalide. Veuillez entrer le numéro de l'opération ou 'aucune'."}
+
+        # Step 3.2: For normal fields (including issue_description)
         try:
+            # For issue_description, keep raw input for matching and showing options
+            if current_field == "issue_description":
+                session_state["data"]["issue_description_raw"] = user_input
             sanitized_input = sanitize_input(user_input, current_field)
             session_state["data"][current_field] = sanitized_input
         except ValueError as e:
             return {"response": f"Erreur: {str(e)}. Veuillez réessayer."}
 
-        # Step 4: Match operation if it's the issue description
+        # Step 4: After user enters issue_description, present top 3 matches and wait choice
         if current_field == "issue_description":
             try:
-                matched_operation = match_issue_to_operation(sanitized_input)
-                session_state["data"]["matched_operation"] = matched_operation
-            except Exception:
-                session_state["data"]["matched_operation"] = {"error": "Impossible de classifier la demande"}
+                # Use your existing matcher function, ensure it returns list of dicts with keys 'operation_name', 'category' etc.
+                top_matches = match_issue_to_operations(user_input)[:3]
+                if not top_matches:
+                    # Fallback if no matches
+                    top_matches = [{
+                        "operation_name": "Demande de rappel",
+                        "category": "Autre",
+                        "time_unit": 0,
+                        "price": 0
+                    }]
+                session_state["data"]["top_matches"] = top_matches
+                session_state["current_field"] = "awaiting_operation_choice"
 
-        # Step 5: Get next field or save appointment
+                options_text = "\n".join(
+                    [f"{idx+1}. {op['operation_name']} ({op['category']})" for idx, op in enumerate(top_matches)]
+                )
+
+                return {
+                    "response": (
+                        "Voici les 3 opérations les plus probables :\n"
+                        f"{options_text}\n"
+                        "Veuillez répondre avec le numéro correspondant ou tapez 'aucune' si aucune ne convient."
+                    )
+                }
+            except Exception:
+                # On exception fallback
+                session_state["data"]["matched_operation"] = {
+                    "operation_name": "Demande de rappel",
+                    "category": "Autre",
+                    "time_unit": 0,
+                    "price": 0
+                }
+                session_state["current_field"] = get_next_field()
+                ai_question = generate_next_question(session_state["current_field"], session_state["data"])
+                return {"response": ai_question}
+
+        # Step 5: Proceed to next field or save
         next_field = get_next_field()
         if next_field:
             session_state["current_field"] = next_field
@@ -349,7 +436,8 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
         try:
             matched_operation = session_state["data"].get("matched_operation")
             matched_operation_json = json.dumps(
-                matched_operation if isinstance(matched_operation, dict) else {"operation": str(matched_operation)}
+                matched_operation if isinstance(matched_operation, dict)
+                else {"operation": str(matched_operation)}
             ) if matched_operation else None
 
             closest_dealer = session_state["data"].get("closest_dealer")
@@ -389,6 +477,7 @@ def chat_with_user(chat_request: ChatRequest, db: Session = Depends(get_db)):
 
     except Exception as e:
         return {"response": f"Une erreur est survenue. {str(e)}"}
+
 
 # Reset chat session explicitly
 @app.post("/reset_chat")
